@@ -1,0 +1,98 @@
+services:
+  web-monitor:
+    build:
+      context: .
+      target: kuma
+    image: custom-kuma:eval
+    container_name: web-monitor
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Paris
+    # on n'expose plus en dehors du réseau docker
+    volumes:
+      - kuma-data:/app/data
+      - ./backup.json:/app/backup/backup.json:ro
+    entrypoint: >
+      sh -c "if [ ! -f /app/data/kuma.db ]; then
+               echo '📦 Import initial du backup.json';
+               node server/server.js --restore /app/backup/backup.json;
+             else
+               node server/server.js;
+             fi"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  netdata:
+    build:
+      context: .
+      target: netdata
+    image: my-netdata:eval
+    container_name: netdata
+    hostname: netdata-local
+    restart: unless-stopped
+    cap_add: [SYS_PTRACE]
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - netdatalib:/var/lib/netdata
+      - netdatacache:/var/cache/netdata
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - redis
+
+  nginx:
+    build:
+      context: .
+      target: nginx
+    image: custom-nginx:eval
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    # On monte uniquement ce qui doit être dynamique
+    volumes:
+      # Webroot ACME (lu par Nginx, écrit par certbot)
+      - certbot-www:/var/www/certbot:ro
+      # Certificats Let’s Encrypt
+      - letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - web-monitor
+      - netdata
+
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    restart: unless-stopped
+    depends_on:
+      - nginx
+    volumes:
+      - certbot-www:/var/www/certbot
+      - letsencrypt:/etc/letsencrypt
+    # ⚠️ Remplace ton email ci-dessous
+    command: >
+      sh -c "
+        certbot certonly --webroot -w /var/www/certbot
+          -d netdatalauba.duckdns.org
+          --email baptiste.defrance@ynov.com --agree-tos --no-eff-email
+          --keep-until-expiring &&
+        while :; do
+          certbot renew --quiet && nginx -s reload 2>/dev/null || true;
+          sleep 12h;
+        done
+      "
+
+  redis:
+    image: redis:alpine
+    container_name: redis
+    restart: unless-stopped
+
+volumes:
+  kuma-data:
+  netdatalib:
+  netdatacache:
+  certbot-www:
+  letsencrypt:
