@@ -1,0 +1,114 @@
+services:
+  # --- Uptime Kuma (racine "/") ---
+  web-monitor:
+    image: brdf/custom-kuma:eval
+    container_name: web-monitor
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Paris
+    volumes:
+      - kuma-data:/app/data
+      - ./backup.json:/app/backup/backup.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 3001 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # --- Netdata (sous-chemin "/netdata/") ---
+  netdata:
+    image: brdf/my-netdata:eval
+    container_name: netdata
+    hostname: netdata-local
+    restart: unless-stopped
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - netdatalib:/var/lib/netdata
+      - netdatacache:/var/cache/netdata
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 19999 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # --- Génère un certif auto-signé temporaire (évite crash nginx) ---
+  init-cert:
+    image: alpine:3.20
+    container_name: init-cert
+    restart: "no"
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+    command: >
+      sh -c '
+        set -e;
+        if [ -f "/etc/letsencrypt/live/netdatalauba.duckdns.org/fullchain.pem" ] &&
+           [ -f "/etc/letsencrypt/live/netdatalauba.duckdns.org/privkey.pem" ]; then
+          echo "✅ Cert existant trouvé, rien à faire.";
+          exit 0;
+        fi;
+        echo "⚠️ Aucun cert trouvé, génération d un auto-signé (1 jour) pour permettre à Nginx de démarrer...";
+        apk add --no-cache openssl >/dev/null;
+        mkdir -p /etc/letsencrypt/live/netdatalauba.duckdns.org;
+        openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+          -keyout /etc/letsencrypt/live/netdatalauba.duckdns.org/privkey.pem \
+          -out    /etc/letsencrypt/live/netdatalauba.duckdns.org/fullchain.pem \
+          -subj "/CN=netdatalauba.duckdns.org";
+        echo "✅ Cert temporaire généré.";
+      '
+
+  # --- Nginx reverse proxy avec TLS ---
+  nginx:
+    image: brdf/custom-nginx:eval
+    container_name: nginx
+    restart: unless-stopped
+    depends_on:
+      init-cert:
+        condition: service_completed_successfully
+      web-monitor:
+        condition: service_started
+      netdata:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - certbot-www:/var/www/certbot:ro
+      - letsencrypt:/etc/letsencrypt:ro
+
+  # --- Certbot (renouvellement automatique) ---
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    restart: unless-stopped
+    depends_on:
+      nginx:
+        condition: service_started
+    environment:
+      - CERTBOT_EMAIL=baptiste.defrance@ynov.com
+      - CERTBOT_DOMAINS=netdatalauba.duckdns.org
+    volumes:
+      - certbot-www:/var/www/certbot
+      - letsencrypt:/etc/letsencrypt
+    command: ["/bin/sh","-lc","while :; do certbot renew --quiet; sleep 12h; done"]
+
+  # --- Redis (pour Netdata) ---
+  redis:
+    image: redis:alpine
+    container_name: redis
+    restart: unless-stopped
+
+# --- Volumes persistants ---
+volumes:
+  kuma-data:
+  netdatalib:
+  netdatacache:
+  letsencrypt:
+    name: root_letsencrypt
+  certbot-www:
+    name: root_certbot-www
